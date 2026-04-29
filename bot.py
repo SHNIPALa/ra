@@ -4,8 +4,6 @@ import threading
 import sqlite3
 import random
 import subprocess
-import requests
-import signal
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -18,9 +16,8 @@ from mutagen.mp3 import MP3
 PORT = 8080
 MUSIC_FOLDER = "music"
 PENDING_FOLDER = "pending"
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
-PUBLIC_URL = os.getenv('PUBLIC_URL', f'http://localhost:{PORT}')
+TOKEN = "8726694308:AAF5_WwE1Tu9csG7ZKjwgG50n-1A5nByM4Q"
+ADMIN_IDS = []  # Добавьте ваш Telegram ID сюда
 
 # Создаем папки
 os.makedirs(MUSIC_FOLDER, exist_ok=True)
@@ -33,8 +30,45 @@ current_song = None
 current_file = None
 current_position = 0
 listeners = 0
-bore_process = None
+public_url = "http://localhost:8080"
 
+# ===== ЗАПУСК BORE ТУННЕЛЯ =====
+def start_bore_tunnel():
+    global public_url
+    try:
+        # Запускаем Bore в фоне
+        process = subprocess.Popen(
+            ['bore', 'local', str(PORT), '--to', 'bore.pub'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Ждем и пытаемся получить порт
+        time.sleep(3)
+        
+        # Читаем stderr где Bore пишет "listening at bore.pub:xxxxx"
+        for i in range(10):
+            if process.stderr:
+                line = process.stderr.readline()
+                if 'listening at' in line:
+                    # Извлекаем адрес
+                    import re
+                    match = re.search(r'bore\.pub:(\d+)', line)
+                    if match:
+                        port = match.group(1)
+                        public_url = f"https://bore.pub:{port}"
+                        print(f"✅ Bore туннель: {public_url}")
+                        return process
+            time.sleep(1)
+        
+        print("⚠️ Не удалось получить URL от Bore")
+        print("💡 Вы можете получить его командой: docker logs radio-bot 2>&1 | grep 'listening at'")
+        return process
+        
+    except Exception as e:
+        print(f"❌ Ошибка Bore: {e}")
+        return None
 
 # ===== БАЗА ДАННЫХ =====
 def init_db():
@@ -47,9 +81,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 init_db()
-
 
 # ===== РАДИО ПЛЕЙЛИСТ =====
 def load_playlist():
@@ -63,7 +95,6 @@ def load_playlist():
         print(f"📀 Загружено {len(playlist)} песен")
     else:
         print(f"⚠️ Нет MP3 в папке '{MUSIC_FOLDER}'")
-
 
 def next_song():
     global current_song, current_file, current_position
@@ -80,7 +111,6 @@ def next_song():
     current_position = 0
     print(f"🎵 Сейчас: {current_song.name}")
 
-
 def approve_song(filename):
     src = Path(PENDING_FOLDER) / filename
     dst = Path(MUSIC_FOLDER) / filename
@@ -90,14 +120,12 @@ def approve_song(filename):
         return True
     return False
 
-
 def reject_song(filename):
     src = Path(PENDING_FOLDER) / filename
     if src.exists():
         src.unlink()
         return True
     return False
-
 
 def get_song_info():
     if current_song and current_song.exists():
@@ -106,22 +134,21 @@ def get_song_info():
             return {
                 'title': current_song.stem,
                 'duration': int(audio.info.length),
-                'duration_str': f"{int(audio.info.length) // 60}:{int(audio.info.length) % 60:02d}"
+                'duration_str': f"{int(audio.info.length)//60}:{int(audio.info.length)%60:02d}"
             }
         except:
             pass
     return {'title': 'Нет песен', 'duration': 0, 'duration_str': '0:00'}
 
-
 # ===== HTTP РАДИО СЕРВЕР =====
 class RadioHandler(BaseHTTPRequestHandler):
-
+    
     def log_message(self, format, *args):
         pass
-
+    
     def do_GET(self):
         global listeners, current_file, current_position, current_song, playlist
-
+        
         if self.path == '/stream.mp3' or self.path == '/stream':
             self.send_response(200)
             self.send_header('Content-Type', 'audio/mpeg')
@@ -129,28 +156,28 @@ class RadioHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-
+            
             listeners += 1
             print(f"🔊 Слушатель: {self.client_address[0]} (всего: {listeners})")
-
+            
             try:
                 while True:
                     if not playlist:
                         time.sleep(1)
                         continue
-
+                    
                     if not current_song and playlist:
                         current_song = playlist[0]
-
+                    
                     if not current_file and current_song:
                         current_file = open(current_song, 'rb')
                         current_position = 0
                         print(f"▶️ Играет: {current_song.name}")
-
+                    
                     if current_file:
                         current_file.seek(current_position)
                         data = current_file.read(8192)
-
+                        
                         if data:
                             current_position += len(data)
                             self.wfile.write(data)
@@ -159,17 +186,17 @@ class RadioHandler(BaseHTTPRequestHandler):
                             current_file.close()
                             current_file = None
                             next_song()
-
+                    
                     time.sleep(0.05)
-            except (BrokenPipeError, ConnectionResetError):
+            except:
                 pass
             finally:
                 listeners -= 1
                 print(f"🔇 Слушатель ушел (всего: {listeners})")
-
+        
         elif self.path == '/':
             info = get_song_info()
-            stream_url = f"{PUBLIC_URL}/stream.mp3"
+            stream_url = f"{public_url}/stream.mp3"
             html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -208,7 +235,7 @@ class RadioHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(html.encode())
-
+        
         elif self.path == '/status':
             import json
             info = get_song_info()
@@ -221,11 +248,11 @@ class RadioHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
-
+        
         else:
             self.send_response(404)
             self.end_headers()
-
+    
     def do_POST(self):
         if self.path == '/next':
             next_song()
@@ -236,38 +263,35 @@ class RadioHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-
 def run_radio_server():
     server = HTTPServer(('0.0.0.0', PORT), RadioHandler)
     print(f"✅ Радио сервер: http://0.0.0.0:{PORT}")
     server.serve_forever()
 
-
 # ===== TELEGRAM БОТ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "No username"
-
+    
     conn = sqlite3.connect('data/radio.db')
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
     conn.commit()
     conn.close()
-
-    stream_url = f"{PUBLIC_URL}/stream.mp3"
+    
+    stream_url = f"{public_url}/stream.mp3"
     info = get_song_info()
-
+    
     keyboard = [
         [InlineKeyboardButton("🎵 Слушать радио", url=stream_url)],
         [InlineKeyboardButton("📥 Скачать поток", url=stream_url)],
         [InlineKeyboardButton("📤 Отправить трек", callback_data="upload")],
         [InlineKeyboardButton("📊 Статус", callback_data="status")]
     ]
-
+    
     if user_id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("🔧 Админ панель", callback_data="admin")])
-        keyboard.append([InlineKeyboardButton("🔄 Обновить URL", callback_data="refresh_url")])
-
+    
     await update.message.reply_text(
         f"🎵 *РАДИО БОТ*\n\n"
         f"🌍 *ССЫЛКА ДЛЯ ДРУЗЕЙ:*\n"
@@ -278,32 +302,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📀 {len(playlist)} песен\n\n"
         f"💡 *Как добавить трек:*\n"
         f"Нажмите 'Отправить трек' и загрузите MP3\n\n"
-        f"⚠️ *Важно:* Ссылка может меняться при перезапуске",
+        f"⚠️ *Если ссылка не работает, подождите 1 минуту*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
-
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-
-    if query.data == "refresh_url" and user_id in ADMIN_IDS:
-        # Обновляем URL (нужно перезапустить Bore)
-        await query.edit_message_text(
-            "🔄 Перезапуск туннеля...\n"
-            "Новая ссылка появится через минуту",
-            parse_mode='Markdown'
-        )
-        # Перезапускаем контейнер
-        os.system("pkill bore")
-        time.sleep(2)
-        os.system("bore local 8080 --to bore.pub &")
-        await query.edit_message_text("✅ Туннель перезапущен! Нажмите /start для обновления ссылки")
-        return
-
-    elif query.data == "upload":
+    
+    if query.data == "upload":
         await query.edit_message_text(
             "📤 *Отправьте MP3 файл*\n\n"
             "Просто отправьте MP3 файл, он уйдет на модерацию.\n"
@@ -311,10 +320,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Максимальный размер: 50MB",
             parse_mode='Markdown'
         )
-
+    
     elif query.data == "status":
         info = get_song_info()
-        stream_url = f"{PUBLIC_URL}/stream.mp3"
+        stream_url = f"{public_url}/stream.mp3"
         await query.edit_message_text(
             f"📊 *СТАТУС РАДИО*\n\n"
             f"🎵 Сейчас играет: *{info['title']}*\n"
@@ -325,10 +334,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 Ссылка для друзей:\n`{stream_url}`",
             parse_mode='Markdown'
         )
-
+    
     elif query.data == "admin" and user_id in ADMIN_IDS:
         await show_admin_panel(update, context)
-
+    
     elif query.data.startswith("approve_"):
         song_id = int(query.data.split("_")[1])
         conn = sqlite3.connect('data/radio.db')
@@ -344,7 +353,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await show_admin_panel(update, context)
-
+    
     elif query.data.startswith("reject_"):
         song_id = int(query.data.split("_")[1])
         conn = sqlite3.connect('data/radio.db')
@@ -360,22 +369,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await show_admin_panel(update, context)
-
+    
     elif query.data == "back":
         await start(update, context)
 
-
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
+    
     conn = sqlite3.connect('data/radio.db')
     c = conn.cursor()
     c.execute("SELECT id, filename, user_name, date FROM pending_songs ORDER BY date DESC")
     pending = c.fetchall()
     conn.close()
-
+    
     keyboard = []
-
+    
     if pending:
         keyboard.append([InlineKeyboardButton("📀 ТРЕКИ НА МОДЕРАЦИИ:", callback_data="none")])
         for song_id, filename, user_name, date in pending:
@@ -385,9 +393,9 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
     else:
         keyboard.append([InlineKeyboardButton("✅ Нет треков на модерации", callback_data="none")])
-
+    
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
-
+    
     await query.edit_message_text(
         "🔧 *АДМИН ПАНЕЛЬ*\n\n"
         f"📀 Треков ожидают: {len(pending)}\n\n"
@@ -396,33 +404,32 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "No username"
-
+    
     if update.message.audio:
         file = update.message.audio
         file_name = file.file_name
-
+        
         if file.file_size > 50 * 1024 * 1024:
             await update.message.reply_text("❌ Файл слишком большой! Максимум 50MB")
             return
-
+        
         status_msg = await update.message.reply_text(f"📥 Загружаю {file_name}...")
-
+        
         try:
             new_file = await context.bot.get_file(file.file_id)
             file_path = Path(PENDING_FOLDER) / file_name
             await new_file.download_to_drive(file_path)
-
+            
             conn = sqlite3.connect('data/radio.db')
             c = conn.cursor()
             c.execute("INSERT INTO pending_songs (filename, user_id, user_name, date) VALUES (?, ?, ?, ?)",
-                      (file_name, user_id, username, datetime.now().isoformat()))
+                     (file_name, user_id, username, datetime.now().isoformat()))
             conn.commit()
             conn.close()
-
+            
             for admin_id in ADMIN_IDS:
                 try:
                     await context.bot.send_message(
@@ -435,7 +442,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except:
                     pass
-
+            
             await status_msg.edit_text(
                 f"✅ *Трек отправлен на модерацию!*\n\n"
                 f"📀 {file_name}\n"
@@ -445,50 +452,36 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
-
-async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stream_url = f"{PUBLIC_URL}/stream.mp3"
-    await update.message.reply_text(
-        f"🔗 *ССЫЛКА ДЛЯ ДРУЗЕЙ*\n\n"
-        f"📥 *Скачать/слушать поток:*\n"
-        f"`{stream_url}`\n\n"
-        f"💡 *Инструкция:*\n"
-        f"1. Отправьте эту ссылку другу\n"
-        f"2. Он откроет ее в браузере\n"
-        f"3. Начнется прослушивание\n\n"
-        f"🎵 Поток бесконечный!\n\n"
-        f"⚠️ При перезапуске бота ссылка может измениться",
-        parse_mode='Markdown'
-    )
-
-
 def main():
+    global public_url
+    
+    # Запускаем Bore туннель
+    bore_process = start_bore_tunnel()
+    
     # Запускаем радио сервер в отдельном потоке
     radio_thread = threading.Thread(target=run_radio_server, daemon=True)
     radio_thread.start()
-
+    
     time.sleep(2)
     load_playlist()
-
+    
     # Запускаем бота
     application = Application.builder().token(TOKEN).build()
-
+    
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("link", get_link))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-
+    
     print("\n" + "=" * 50)
     print("✅ БОТ ЗАПУЩЕН!")
     print("=" * 50)
     print(f"\n🔗 ССЫЛКА ДЛЯ ДРУЗЕЙ:")
-    print(f"   {PUBLIC_URL}/stream.mp3")
-    print(f"\n🤖 Telegram бот: @{TOKEN.split(':')[0]}")
-    print("\n📀 Админ панель: /start в боте")
+    print(f"   {public_url}/stream.mp3")
+    print("\n💡 Если ссылка не работает, проверьте логи:")
+    print("   docker logs radio-bot 2>&1 | grep 'listening at'")
     print("=" * 50 + "\n")
-
+    
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
