@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  radio-bot:
+    build: .
+    container_name: radio-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+    ports:
+      - "8080:8080"  # Для локального доступа
+    volumes:
+      - ./music:/app/music
+      - ./pending:/app/pending
+      - ./data:/app/data
+    network_mode: bridge
