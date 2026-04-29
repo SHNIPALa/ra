@@ -4,6 +4,8 @@ import threading
 import sqlite3
 import random
 import subprocess
+import re
+import requests
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -30,45 +32,57 @@ current_song = None
 current_file = None
 current_position = 0
 listeners = 0
-public_url = "http://localhost:8080"
+public_url = None
+tunnel_process = None
 
-# ===== ЗАПУСК BORE ТУННЕЛЯ =====
-def start_bore_tunnel():
-    global public_url
+# ===== ЗАПУСК LOCAL TUNNEL =====
+def start_localtunnel():
+    global public_url, tunnel_process
     try:
-        # Запускаем Bore в фоне
-        process = subprocess.Popen(
-            ['bore', 'local', str(PORT), '--to', 'bore.pub'],
+        # Запускаем LocalTunnel в фоне с уникальным субдоменом
+        import time
+        unique_name = f"radio{int(time.time())}"
+        
+        tunnel_process = subprocess.Popen(
+            ['lt', '--port', str(PORT), '--subdomain', unique_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
         
-        # Ждем и пытаемся получить порт
-        time.sleep(3)
+        print(f"🔄 Запуск LocalTunnel с субдоменом: {unique_name}")
         
-        # Читаем stderr где Bore пишет "listening at bore.pub:xxxxx"
-        for i in range(10):
-            if process.stderr:
-                line = process.stderr.readline()
-                if 'listening at' in line:
-                    # Извлекаем адрес
-                    import re
-                    match = re.search(r'bore\.pub:(\d+)', line)
-                    if match:
-                        port = match.group(1)
-                        public_url = f"https://bore.pub:{port}"
-                        print(f"✅ Bore туннель: {public_url}")
-                        return process
+        # Ждем и читаем вывод для получения URL
+        for i in range(20):
+            if tunnel_process.stdout:
+                line = tunnel_process.stdout.readline()
+                print(f"LT: {line}")
+                # LocalTunnel выводит URL в stdout
+                url_match = re.search(r'https?://[a-zA-Z0-9\-]+\.loca\.lt', line)
+                if url_match:
+                    public_url = url_match.group(0)
+                    print(f"✅ LocalTunnel URL: {public_url}")
+                    return True
             time.sleep(1)
         
-        print("⚠️ Не удалось получить URL от Bore")
-        print("💡 Вы можете получить его командой: docker logs radio-bot 2>&1 | grep 'listening at'")
-        return process
+        # Если не нашли в stdout, пробуем через stderr
+        for i in range(10):
+            if tunnel_process.stderr:
+                line = tunnel_process.stderr.readline()
+                print(f"LT stderr: {line}")
+                url_match = re.search(r'https?://[a-zA-Z0-9\-]+\.loca\.lt', line)
+                if url_match:
+                    public_url = url_match.group(0)
+                    print(f"✅ LocalTunnel URL: {public_url}")
+                    return True
+            time.sleep(1)
+        
+        print("⚠️ Не удалось получить URL от LocalTunnel")
+        return False
         
     except Exception as e:
-        print(f"❌ Ошибка Bore: {e}")
-        return None
+        print(f"❌ Ошибка LocalTunnel: {e}")
+        return False
 
 # ===== БАЗА ДАННЫХ =====
 def init_db():
@@ -196,7 +210,7 @@ class RadioHandler(BaseHTTPRequestHandler):
         
         elif self.path == '/':
             info = get_song_info()
-            stream_url = f"{public_url}/stream.mp3"
+            stream_url = f"{public_url}/stream.mp3" if public_url else f"http://localhost:{PORT}/stream.mp3"
             html = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -279,14 +293,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    stream_url = f"{public_url}/stream.mp3"
     info = get_song_info()
     
     keyboard = [
-        [InlineKeyboardButton("🎵 Слушать радио", url=stream_url)],
-        [InlineKeyboardButton("📥 Скачать поток", url=stream_url)],
         [InlineKeyboardButton("📤 Отправить трек", callback_data="upload")],
-        [InlineKeyboardButton("📊 Статус", callback_data="status")]
+        [InlineKeyboardButton("📊 Статус", callback_data="status")],
+        [InlineKeyboardButton("🔗 Получить ссылку", callback_data="get_link")]
     ]
     
     if user_id in ADMIN_IDS:
@@ -294,25 +306,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"🎵 *РАДИО БОТ*\n\n"
-        f"🌍 *ССЫЛКА ДЛЯ ДРУЗЕЙ:*\n"
-        f"`{stream_url}`\n\n"
         f"📊 *Сейчас в эфире:*\n"
         f"🎵 {info['title']}\n"
         f"👥 {listeners} слушателей\n"
         f"📀 {len(playlist)} песен\n\n"
+        f"💡 *Как слушать:*\n"
+        f"Нажмите 'Получить ссылку' для получения адреса потока\n\n"
         f"💡 *Как добавить трек:*\n"
-        f"Нажмите 'Отправить трек' и загрузите MP3\n\n"
-        f"⚠️ *Если ссылка не работает, подождите 1 минуту*",
+        f"Нажмите 'Отправить трек' и загрузите MP3",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global public_url
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
-    if query.data == "upload":
+    if query.data == "get_link":
+        if public_url:
+            stream_url = f"{public_url}/stream.mp3"
+            await query.edit_message_text(
+                f"🔗 *ССЫЛКА ДЛЯ ДРУЗЕЙ*\n\n"
+                f"📥 *Прямая ссылка (скачивание/прослушивание):*\n"
+                f"`{stream_url}`\n\n"
+                f"🌐 *Веб-плеер:*\n"
+                f"{public_url}\n\n"
+                f"💡 *Инструкция:*\n"
+                f"1. Отправьте ссылку другу\n"
+                f"2. Он откроет в браузере или VLC\n"
+                f"3. Начнется прослушивание\n\n"
+                f"🎵 Поток бесконечный!",
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(
+                "⏳ *Ссылка еще не готова*\n\n"
+                "Подождите 1-2 минуты, пока настроится туннель.\n"
+                "Затем нажмите 'Получить ссылку' снова.\n\n"
+                "Если проблема повторяется, проверьте логи:\n"
+                "`docker logs radio-bot`",
+                parse_mode='Markdown'
+            )
+    
+    elif query.data == "upload":
         await query.edit_message_text(
             "📤 *Отправьте MP3 файл*\n\n"
             "Просто отправьте MP3 файл, он уйдет на модерацию.\n"
@@ -323,15 +361,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "status":
         info = get_song_info()
-        stream_url = f"{public_url}/stream.mp3"
         await query.edit_message_text(
             f"📊 *СТАТУС РАДИО*\n\n"
             f"🎵 Сейчас играет: *{info['title']}*\n"
             f"⏱️ Длительность: {info['duration_str']}\n"
             f"👥 Слушателей онлайн: *{listeners}*\n"
             f"📀 Песен в плейлисте: *{len(playlist)}*\n"
-            f"🎚️ Статус: ✅ Активен\n\n"
-            f"🔗 Ссылка для друзей:\n`{stream_url}`",
+            f"🚀 Туннель: {'✅ Активен' if public_url else '⏳ Запускается...'}\n",
             parse_mode='Markdown'
         )
     
@@ -455,10 +491,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global public_url
     
-    # Запускаем Bore туннель
-    bore_process = start_bore_tunnel()
+    # Запускаем LocalTunnel
+    print("🔄 Запуск LocalTunnel...")
+    success = start_localtunnel()
     
-    # Запускаем радио сервер в отдельном потоке
+    if success:
+        print(f"✅ Публичный URL: {public_url}")
+    else:
+        print("⚠️ Не удалось получить URL от LocalTunnel")
+        print("💡 Попробуйте запустить вручную в другом терминале:")
+        print("   npx localtunnel --port 8080")
+    
+    # Запускаем радио сервер
     radio_thread = threading.Thread(target=run_radio_server, daemon=True)
     radio_thread.start()
     
@@ -475,10 +519,17 @@ def main():
     print("\n" + "=" * 50)
     print("✅ БОТ ЗАПУЩЕН!")
     print("=" * 50)
-    print(f"\n🔗 ССЫЛКА ДЛЯ ДРУЗЕЙ:")
-    print(f"   {public_url}/stream.mp3")
-    print("\n💡 Если ссылка не работает, проверьте логи:")
-    print("   docker logs radio-bot 2>&1 | grep 'listening at'")
+    if public_url:
+        print(f"\n🔗 ССЫЛКА ДЛЯ ДРУЗЕЙ:")
+        print(f"   {public_url}/stream.mp3")
+    else:
+        print("\n⚠️ URL НЕ ПОЛУЧЕН!")
+        print("   Запустите туннель вручную:")
+        print("   1. Откройте новый терминал")
+        print("   2. Выполните: npx localtunnel --port 8080")
+        print("   3. Скопируйте полученную ссылку")
+        print("   4. Отправьте друзьям: ССЫЛКА/stream.mp3")
+    print("\n🤖 Бот готов к работе в Telegram")
     print("=" * 50 + "\n")
     
     application.run_polling()
